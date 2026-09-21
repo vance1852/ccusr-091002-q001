@@ -14,6 +14,8 @@
 #include "../utils/Logger.h"
 #include "../db/DatabaseManager.h"
 #include "../dao/SpeedDAO.h"
+#include "../dao/SpeedBatchDAO.h"
+#include "../dao/SpeedClaimHistoryDAO.h"
 #include "../dao/SpliceDAO.h"
 #include "../dao/FlawDAO.h"
 #include "../dao/StopDAO.h"
@@ -22,19 +24,63 @@
 #include "../dao/RemoveDAO.h"
 
 #include <cstdlib>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <vector>
+#include <algorithm>
+#include <ctime>
 
 // ============================================
-// 辅助：清理所有表
+// 辅助：清理所有表（遵守外键删除顺序）
 // ============================================
 static void cleanAllTables() {
     auto& dbm = db::DatabaseManager::instance();
+    dbm.execute("DELETE FROM SPEED_CLAIM_HISTORY");
     dbm.execute("DELETE FROM SPEED");
+    dbm.execute("DELETE FROM SPEED_BATCH");
     dbm.execute("DELETE FROM SPLICE");
     dbm.execute("DELETE FROM FLAW");
     dbm.execute("DELETE FROM STOP");
     dbm.execute("DELETE FROM COMPARE");
     dbm.execute("DELETE FROM HISTORY");
     dbm.execute("DELETE FROM REMOVE");
+}
+
+static std::string testFmtTime(std::time_t t) {
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+    return buf;
+}
+
+// 创建一个当前开放的批次并返回批次号
+static std::string createOpenBatch(const std::string& tag = "") {
+    std::time_t now = std::time(nullptr);
+    std::string batchNo = "TB-" + std::to_string(now) + "-" + std::to_string(rand() % 100000)
+        + (tag.empty() ? "" : "-" + tag);
+    dao::SpeedBatchDAO batchDao;
+    entity::SpeedBatch batch;
+    batch.batchNo = batchNo;
+    batch.startTime = testFmtTime(now - 60);
+    batch.endTime = testFmtTime(now + 3600);
+    long long id = batchDao.create(batch);
+    if (id <= 0) throw test::AssertionError("failed to create open batch " + batchNo);
+    return batchNo;
+}
+
+static int insertSpeedInBatch(const std::string& batchNo, float value = 100.0f) {
+    std::time_t now = std::time(nullptr);
+    std::string today = testFmtTime(now).substr(0, 10);
+    dao::SpeedDAO dao;
+    entity::Speed s;
+    s.value = value;
+    s.date = today;
+    s.batchNo = batchNo;
+    s.sampledAt = testFmtTime(now);
+    int id = dao.insertWithBatch(s);
+    if (id <= 0) throw test::AssertionError("failed to insert speed into batch");
+    return id;
 }
 
 // ============================================
@@ -247,6 +293,277 @@ TEST(SpeedDAO_Count) {
     dao.insert(s);
     dao.insert(s);
     ASSERT_EQ(dao.count(), 2);
+}
+
+// ============================================
+// 4b. SPEED 批次与一次性领用流程测试
+// ============================================
+TEST(SpeedBatch_RejectsInvalidWindow) {
+    cleanAllTables();
+    std::time_t now = std::time(nullptr);
+    dao::SpeedBatchDAO batchDao;
+    entity::SpeedBatch b;
+    b.batchNo = "TB-BAD-WINDOW";
+    b.startTime = testFmtTime(now + 100);
+    b.endTime = testFmtTime(now); // end <= start
+    ASSERT_EQ(batchDao.create(b), 0LL);
+    ASSERT_FALSE(batchDao.findByNo("TB-BAD-WINDOW").has_value());
+}
+
+TEST(SpeedBatch_RejectsEmptyFields) {
+    cleanAllTables();
+    dao::SpeedBatchDAO batchDao;
+    entity::SpeedBatch b; // 全空
+    ASSERT_EQ(batchDao.create(b), 0LL);
+}
+
+TEST(SpeedDAO_InsertWithBatchRejectsUnknownBatch) {
+    cleanAllTables();
+    dao::SpeedDAO dao;
+    entity::Speed s;
+    s.value = 1.0f; s.date = "2026-09-20";
+    s.batchNo = "NOT-EXIST"; s.sampledAt = "2026-09-20 08:00:00";
+    ASSERT_EQ(dao.insertWithBatch(s), 0);
+}
+
+TEST(SpeedDAO_FindByBatchNo) {
+    cleanAllTables();
+    std::string batchNo = createOpenBatch();
+    int id1 = insertSpeedInBatch(batchNo, 10.0f);
+    int id2 = insertSpeedInBatch(batchNo, 20.0f);
+    dao::SpeedDAO dao;
+    auto recs = dao.findByBatchNo(batchNo);
+    ASSERT_EQ(recs.size(), (size_t)2);
+    ASSERT_EQ(recs[0].id, id1);
+    ASSERT_EQ(recs[1].id, id2);
+    ASSERT_STR_EQ(recs[0].batchNo, batchNo);
+    ASSERT_STR_EQ(recs[0].status, entity::speed_status::AVAILABLE);
+}
+
+TEST(SpeedDAO_ClaimSingle) {
+    cleanAllTables();
+    std::string batchNo = createOpenBatch();
+    int id = insertSpeedInBatch(batchNo);
+    dao::SpeedDAO dao;
+    auto rec = dao.claim(batchNo, "task-1", 60, "single claim");
+    ASSERT_TRUE(rec.has_value());
+    ASSERT_EQ(rec->id, id);
+    ASSERT_STR_EQ(rec->status, entity::speed_status::CLAIMED);
+    ASSERT_STR_EQ(rec->claimedBy, "task-1");
+    ASSERT_FALSE(rec->leaseExpiresAt.empty());
+
+    // 已被领走，再领应无记录
+    auto again = dao.claim(batchNo, "task-2", 60);
+    ASSERT_FALSE(again.has_value());
+}
+
+TEST(SpeedDAO_ClaimClosedBatchRejected) {
+    cleanAllTables();
+    std::string batchNo = createOpenBatch();
+    insertSpeedInBatch(batchNo);
+    dao::SpeedBatchDAO batchDao;
+    ASSERT_EQ(batchDao.close(batchNo), 1);
+    dao::SpeedDAO dao;
+    ASSERT_FALSE(dao.claim(batchNo, "task-1", 60).has_value());
+}
+
+// 两个独立连接上的任务在起跑栅栏后同时领用同一条记录，恰有一个成功
+TEST(SpeedDAO_ConcurrentClaimOnlyOneWinner) {
+    cleanAllTables();
+    config::DatabaseConfig cfg;
+    cfg.loadFromEnv();
+    std::string batchNo = createOpenBatch();
+    int id = insertSpeedInBatch(batchNo);
+
+    auto connA = db::DatabaseManager::create(cfg);
+    auto connB = db::DatabaseManager::create(cfg);
+
+    struct Out { bool got = false; int sid = -1; };
+    Out oa, ob;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    auto racer = [&](const std::string& task, Out& out, db::DatabaseManager& conn) {
+        dao::SpeedDAO dao(conn);
+        ready.fetch_add(1);
+        while (!go.load()) std::this_thread::yield();
+        auto r = dao.claim(batchNo, task, 60, "concurrent");
+        if (r) { out.got = true; out.sid = r->id; }
+    };
+    std::thread t1(racer, "task-A", std::ref(oa), std::ref(*connA));
+    std::thread t2(racer, "task-B", std::ref(ob), std::ref(*connB));
+    while (ready.load() < 2) std::this_thread::yield();
+    go.store(true);
+    t1.join(); t2.join();
+
+    ASSERT_TRUE(oa.got || ob.got);          // 至少一个拿到
+    ASSERT_FALSE(oa.got && ob.got);         // 但不能两个都拿到
+    int winnerId = oa.got ? oa.sid : ob.sid;
+    ASSERT_EQ(winnerId, id);
+}
+
+// 20 条记录被两个连接上的任务并发抢空，不重复、不遗漏
+TEST(SpeedDAO_ConcurrentDrainNoDuplicate) {
+    cleanAllTables();
+    config::DatabaseConfig cfg;
+    cfg.loadFromEnv();
+    std::string batchNo = createOpenBatch();
+    const int N = 20;
+    for (int i = 0; i < N; ++i) insertSpeedInBatch(batchNo, 100.0f + i);
+
+    auto connA = db::DatabaseManager::create(cfg);
+    auto connB = db::DatabaseManager::create(cfg);
+    std::vector<int> ids;
+    std::mutex mtx;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    auto drainer = [&](const std::string& task, db::DatabaseManager& conn) {
+        dao::SpeedDAO dao(conn);
+        ready.fetch_add(1);
+        while (!go.load()) std::this_thread::yield();
+        while (true) {
+            auto r = dao.claim(batchNo, task, 60, "drain");
+            if (!r) break;
+            std::lock_guard<std::mutex> lk(mtx);
+            ids.push_back(r->id);
+        }
+    };
+    std::thread t1(drainer, "task-A", std::ref(*connA));
+    std::thread t2(drainer, "task-B", std::ref(*connB));
+    while (ready.load() < 2) std::this_thread::yield();
+    go.store(true);
+    t1.join(); t2.join();
+
+    ASSERT_EQ(ids.size(), (size_t)N);
+    std::sort(ids.begin(), ids.end());
+    ASSERT_TRUE(std::adjacent_find(ids.begin(), ids.end()) == ids.end());
+}
+
+TEST(SpeedDAO_ReleaseOnCancelReclaimable) {
+    cleanAllTables();
+    std::string batchNo = createOpenBatch();
+    int id = insertSpeedInBatch(batchNo);
+    dao::SpeedDAO dao;
+    ASSERT_TRUE(dao.claim(batchNo, "task-1", 60).has_value());
+    ASSERT_TRUE(dao.release(id, "task-1", "任务取消"));
+
+    auto rec = dao.findById(id);
+    ASSERT_STR_EQ(rec->status, entity::speed_status::AVAILABLE);
+    ASSERT_TRUE(rec->claimedBy.empty());
+
+    // 非持有者不能释放他人/已释放记录
+    ASSERT_FALSE(dao.release(id, "intruder", "非法释放"));
+
+    // 释放后可被重新领用
+    auto again = dao.claim(batchNo, "task-2", 60, "取消后重领");
+    ASSERT_TRUE(again.has_value());
+    ASSERT_EQ(again->id, id);
+    ASSERT_STR_EQ(again->claimedBy, "task-2");
+}
+
+TEST(SpeedDAO_ExpiredLeaseReclaimedThenReissued) {
+    cleanAllTables();
+    std::string batchNo = createOpenBatch();
+    int id = insertSpeedInBatch(batchNo);
+    dao::SpeedDAO dao;
+    ASSERT_TRUE(dao.claim(batchNo, "slow-task", 1, "租约1秒").has_value());
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    int n = dao.reclaimExpiredLeases();
+    ASSERT_GE(n, 1);
+    auto rec = dao.findById(id);
+    ASSERT_STR_EQ(rec->status, entity::speed_status::AVAILABLE);
+
+    auto fast = dao.claim(batchNo, "fast-task", 60, "回收后重领");
+    ASSERT_TRUE(fast.has_value());
+    ASSERT_EQ(fast->id, id);
+}
+
+TEST(SpeedDAO_ConsumeIsTerminalAndIdempotent) {
+    cleanAllTables();
+    std::string batchNo = createOpenBatch();
+    int id = insertSpeedInBatch(batchNo);
+    dao::SpeedDAO dao;
+    dao.claim(batchNo, "task-1", 60);
+    ASSERT_TRUE(dao.consume(id, "task-1", "结果确认"));
+
+    auto rec = dao.findById(id);
+    ASSERT_STR_EQ(rec->status, entity::speed_status::CONSUMED);
+    ASSERT_EQ(rec->flag, 1);
+    ASSERT_FALSE(rec->consumedAt.empty());
+
+    // 终态不可释放
+    ASSERT_FALSE(dao.release(id, "task-1", "尝试回退"));
+    // 他人不可确认
+    ASSERT_FALSE(dao.consume(id, "intruder", "他人确认"));
+    // 同一持有者重连后重试：幂等成功，不产生倒退
+    ASSERT_TRUE(dao.consume(id, "task-1", "重连后重试"));
+    ASSERT_STR_EQ(dao.findById(id)->status, entity::speed_status::CONSUMED);
+}
+
+// 确认消费提交后，主动重建数据库连接，终态仍然存在且不可倒退
+TEST(SpeedDAO_ConsumedSurvivesReconnect) {
+    cleanAllTables();
+    config::DatabaseConfig cfg;
+    cfg.loadFromEnv();
+    std::string batchNo = createOpenBatch();
+    int id = insertSpeedInBatch(batchNo);
+
+    {
+        auto conn = db::DatabaseManager::create(cfg);
+        dao::SpeedDAO dao(*conn);
+        dao.claim(batchNo, "task-1", 60);
+        ASSERT_TRUE(dao.consume(id, "task-1", "结果确认"));
+        conn->reconnect(); // 关闭并重建连接
+        auto rec = dao.findById(id);
+        ASSERT_STR_EQ(rec->status, entity::speed_status::CONSUMED);
+        ASSERT_EQ(rec->flag, 1);
+        ASSERT_FALSE(dao.release(id, "task-1", "重连后回退"));
+    }
+
+    // 换一条全新连接再查一次，状态依旧
+    auto conn2 = db::DatabaseManager::create(cfg);
+    dao::SpeedDAO dao2(*conn2);
+    ASSERT_STR_EQ(dao2.findById(id)->status, entity::speed_status::CONSUMED);
+}
+
+TEST(SpeedDAO_HistoryRecordsClaimReleaseConsumeReasons) {
+    cleanAllTables();
+    std::string batchNo = createOpenBatch();
+    int id = insertSpeedInBatch(batchNo);
+    dao::SpeedDAO dao;
+    dao.claim(batchNo, "task-1", 1, "首次领用");
+    // 等租约超时并回收，产生 RELEASE 历史
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    dao.reclaimExpiredLeases();
+    dao.claim(batchNo, "task-2", 60, "回收后领用");
+    ASSERT_TRUE(dao.consume(id, "task-2", "最终确认"));
+
+    auto hist = dao.historyOf(id);
+    // 预期顺序：CLAIM(task-1) -> RELEASE(task-1 超时) -> CLAIM(task-2) -> CONSUME(task-2)
+    ASSERT_GE(hist.size(), (size_t)4);
+    ASSERT_STR_EQ(hist[0].action, entity::speed_claim_action::CLAIM);
+    ASSERT_STR_EQ(hist[0].actor, "task-1");
+    ASSERT_STR_EQ(hist[0].reason, "首次领用");
+    ASSERT_STR_EQ(hist[1].action, entity::speed_claim_action::RELEASE);
+    ASSERT_STR_EQ(hist[1].reason, "租约超时，系统自动回收释放");
+    ASSERT_STR_EQ(hist[2].action, entity::speed_claim_action::CLAIM);
+    ASSERT_STR_EQ(hist[2].actor, "task-2");
+    ASSERT_STR_EQ(hist[3].action, entity::speed_claim_action::CONSUME);
+    ASSERT_STR_EQ(hist[3].reason, "最终确认");
+
+    // 按批次也能追溯
+    dao::SpeedClaimHistoryDAO hdao;
+    ASSERT_GE(hdao.findByBatchNo(batchNo).size(), (size_t)4);
+}
+
+TEST(SpeedDAO_LegacyFindByDateStillWorks) {
+    cleanAllTables();
+    std::string batchNo = createOpenBatch();
+    insertSpeedInBatch(batchNo, 11.0f);
+    std::string today = testFmtTime(std::time(nullptr)).substr(0, 10);
+    dao::SpeedDAO dao;
+    auto recs = dao.findByDate(today); // 原有按日期查询方式
+    ASSERT_GE(recs.size(), (size_t)1);
 }
 
 // ============================================

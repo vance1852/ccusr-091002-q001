@@ -44,6 +44,7 @@ namespace db {
             mysql_close(conn_);
             conn_ = nullptr;
             connected_ = false;
+            inTransaction_ = false;
             LOG_INFO(TAG, "Database connection closed");
         }
     }
@@ -139,6 +140,43 @@ namespace db {
         long long id = static_cast<long long>(mysql_insert_id(conn_));
         LOG_DEBUG(TAG, "Inserted ID: " + std::to_string(id));
         return id;
+    }
+
+    void DatabaseManager::beginTransaction() {
+        ensureConnected();
+        if (inTransaction_) {
+            throw DatabaseException("beginTransaction() called while a transaction is already active");
+        }
+        if (mysql_query(conn_, "START TRANSACTION") != 0) {
+            std::string err = "BEGIN failed: ";
+            err += mysql_error(conn_);
+            throw DatabaseException(err);
+        }
+        inTransaction_ = true;
+        LOG_DEBUG(TAG, "Transaction begun");
+    }
+
+    void DatabaseManager::commit() {
+        if (!inTransaction_) return;
+        if (mysql_query(conn_, "COMMIT") != 0) {
+            std::string err = "COMMIT failed: ";
+            err += mysql_error(conn_);
+            inTransaction_ = false;
+            throw DatabaseException(err);
+        }
+        inTransaction_ = false;
+        LOG_DEBUG(TAG, "Transaction committed");
+    }
+
+    void DatabaseManager::rollback() noexcept {
+        if (!inTransaction_) return;
+        // 回滚失败只记录日志，不抛异常（通常在异常处理路径中调用）
+        if (mysql_query(conn_, "ROLLBACK") != 0) {
+            LOG_ERROR(TAG, std::string("ROLLBACK failed: ") + mysql_error(conn_));
+        } else {
+            LOG_DEBUG(TAG, "Transaction rolled back");
+        }
+        inTransaction_ = false;
     }
 
     std::string DatabaseManager::escape(const std::string& str) {

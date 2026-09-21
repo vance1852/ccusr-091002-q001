@@ -33,11 +33,25 @@ namespace db {
             return inst;
         }
 
+        // 创建并初始化一条独立连接（并发任务/演示用）。
+        // 调用方负责持有返回对象；连接在析构时关闭。
+        static std::unique_ptr<DatabaseManager> create(const config::DatabaseConfig& cfg) {
+            std::unique_ptr<DatabaseManager> dm(new DatabaseManager());
+            dm->init(cfg);
+            return dm;
+        }
+
+        DatabaseManager() = default;
+        ~DatabaseManager();
+
         // 初始化连接
         void init(const config::DatabaseConfig& cfg);
 
         // 关闭连接
         void close();
+
+        // 主动断开并按原配置重建连接（用于演示/验证已提交状态在重连后仍然存在）
+        void reconnect();
 
         // 执行非查询 SQL (INSERT/UPDATE/DELETE)，返回受影响行数
         int execute(const std::string& sql);
@@ -48,6 +62,13 @@ namespace db {
         // 执行 INSERT 并返回自增 ID
         long long insertAndGetId(const std::string& sql);
 
+        // —— 事务边界 ——
+        // 领用/释放/消费等多语句操作必须包裹在事务中，
+        // 借助 InnoDB 行锁保证并发竞争下同一条记录只能被一个领取者拿到。
+        void beginTransaction();
+        void commit();
+        void rollback() noexcept;
+
         // 转义字符串防 SQL 注入
         std::string escape(const std::string& str);
 
@@ -55,18 +76,15 @@ namespace db {
         bool isConnected() const;
 
     private:
-        DatabaseManager() = default;
-        ~DatabaseManager();
-
         DatabaseManager(const DatabaseManager&) = delete;
         DatabaseManager& operator=(const DatabaseManager&) = delete;
 
         MYSQL* conn_ = nullptr;
         config::DatabaseConfig config_;
         bool connected_ = false;
+        bool inTransaction_ = false;
 
         void ensureConnected();
-        void reconnect();
     };
 
 } // namespace db

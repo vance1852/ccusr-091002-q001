@@ -8,14 +8,59 @@ CREATE DATABASE IF NOT EXISTS industrial_inspection
 
 USE industrial_inspection;
 
--- 速度表
+-- 采样批次表（速度记录的领用批次，起止时间构成有效领用窗口）
+-- 删除顺序：先子表后父表，避免外键约束冲突
+DROP TABLE IF EXISTS SPEED_CLAIM_HISTORY;
 DROP TABLE IF EXISTS SPEED;
+DROP TABLE IF EXISTS SPEED_BATCH;
+
+CREATE TABLE SPEED_BATCH (
+    id         BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+    batch_no   VARCHAR(64) NOT NULL UNIQUE COMMENT '批次标识，如 B-20260920-001',
+    start_time DATETIME NOT NULL COMMENT '批次起始时刻',
+    end_time   DATETIME NOT NULL COMMENT '批次截止时刻，必须晚于起始时刻',
+    status     TINYINT NOT NULL DEFAULT 0 COMMENT '批次状态，0开放领用，1已关闭',
+    remark     VARCHAR(255) NOT NULL DEFAULT '' COMMENT '备注',
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+    CONSTRAINT chk_speed_batch_window CHECK (end_time > start_time)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '速度采样批次表';
+
+-- 速度表（保留 date/flag 原有字段与按日期查询方式，新增批次、采样时刻与领用状态）
 CREATE TABLE SPEED (
-    id        INT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
-    value     FLOAT NOT NULL COMMENT '速度值',
-    date      VARCHAR(32) NOT NULL COMMENT '日期',
-    flag      TINYINT DEFAULT 0 COMMENT '使用标志，1为已使用（废弃）'
+    id               INT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+    value            FLOAT NOT NULL COMMENT '速度值',
+    date             VARCHAR(32) NOT NULL COMMENT '日期（保留原有按日期查询口径）',
+    flag             TINYINT DEFAULT 0 COMMENT '使用标志，1为已使用（废弃）；确认消费时置1',
+    batch_no         VARCHAR(64) NULL COMMENT '所属采样批次标识',
+    sampled_at       DATETIME NULL COMMENT '采样时刻',
+    status           VARCHAR(16) NOT NULL DEFAULT 'AVAILABLE' COMMENT '领用状态：AVAILABLE可领用 / CLAIMED已领用待消费 / CONSUMED已确认消费（终态）',
+    claimed_by       VARCHAR(64) NULL COMMENT '当前领用者（任务标识）',
+    claimed_at       DATETIME(3) NULL COMMENT '最近一次领用时刻',
+    lease_expires_at DATETIME(3) NULL COMMENT '领用租约到期时刻，超时未消费可重新释放',
+    consumed_at      DATETIME(3) NULL COMMENT '确认消费时刻（终态时间戳）',
+    KEY idx_speed_status (status),
+    KEY idx_speed_batch (batch_no),
+    KEY idx_speed_lease (status, lease_expires_at),
+    KEY idx_speed_date (date),
+    CONSTRAINT fk_speed_batch FOREIGN KEY (batch_no)
+        REFERENCES SPEED_BATCH (batch_no)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '速度表';
+
+-- 速度记录领用状态历史表（每次领用/释放/消费都追加一行，只增不改，供运维追溯）
+CREATE TABLE SPEED_CLAIM_HISTORY (
+    id         BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+    speed_id   INT NOT NULL COMMENT '速度记录ID',
+    batch_no   VARCHAR(64) NULL COMMENT '领用发生时所属批次标识',
+    action     VARCHAR(16) NOT NULL COMMENT '动作：CLAIM领用 / RELEASE释放 / CONSUME确认消费',
+    actor      VARCHAR(64) NOT NULL DEFAULT '' COMMENT '操作者（任务标识；超时回收时为原领用者）',
+    reason     VARCHAR(255) NOT NULL DEFAULT '' COMMENT '动作原因，如任务取消、租约超时、结果确认',
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '动作发生时刻',
+    KEY idx_hist_speed (speed_id),
+    KEY idx_hist_batch (batch_no),
+    KEY idx_hist_action (action),
+    CONSTRAINT fk_hist_speed FOREIGN KEY (speed_id)
+        REFERENCES SPEED (id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '速度领用状态历史表';
 
 -- 接缝表
 DROP TABLE IF EXISTS SPLICE;

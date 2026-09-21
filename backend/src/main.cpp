@@ -12,11 +12,21 @@
 #include <iostream>
 #include <string>
 #include <iomanip>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <vector>
+#include <algorithm>
+#include <functional>
+#include <ctime>
 
 #include "config/AppConfig.h"
 #include "utils/Logger.h"
 #include "db/DatabaseManager.h"
 #include "dao/SpeedDAO.h"
+#include "dao/SpeedBatchDAO.h"
+#include "dao/SpeedClaimHistoryDAO.h"
 #include "dao/SpliceDAO.h"
 #include "dao/FlawDAO.h"
 #include "dao/StopDAO.h"
@@ -261,8 +271,204 @@ static void demoRemove(dao::RemoveDAO& removeDao) {
 }
 
 // ============================================
-// 主入口
+// SPEED 一次性领用 / 可追溯流程演示
+//   - 两个领取者同时竞争同一条记录，只有一个成功
+//   - 任务取消释放、租约超时回收均可重新发放
+//   - 确认消费为终态，连接重建后也不倒退
+//   - 每条记录历次领取/释放/消费原因均可追溯
 // ============================================
+static std::string fmtTime(std::time_t t) {
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+    return buf;
+}
+
+static void printHistory(dao::SpeedDAO& speedDao, int speedId) {
+    auto hist = speedDao.historyOf(speedId);
+    cout << "    记录 #" << speedId << " 共 " << hist.size() << " 条状态历史：" << endl;
+    for (auto& h : hist) {
+        cout << "      [" << h.createdAt << "] " << h.action
+             << "  actor=" << h.actor
+             << "  batch=" << (h.batchNo.empty() ? "-" : h.batchNo)
+             << "  reason=" << (h.reason.empty() ? "-" : h.reason) << endl;
+    }
+}
+
+static void demoSpeedTraceability(const config::DatabaseConfig& dbConfig) {
+    printSeparator("SPEED 一次性领用 / 可追溯流程");
+
+    using namespace entity;
+
+    // 每条并发任务使用各自独立的连接，模拟不同检测进程
+    auto connA = db::DatabaseManager::create(dbConfig);
+    auto connB = db::DatabaseManager::create(dbConfig);
+
+    // 准备一个有效的批次窗口：起止时间必须有效（end > start）
+    std::srand(static_cast<unsigned>(std::time(nullptr)));
+    std::time_t now = std::time(nullptr);
+    std::string today = fmtTime(now).substr(0, 10);
+    std::string batchNo = "B-" + today + "-" + std::to_string(now % 100000)
+        + "-" + std::to_string(std::rand() % 100000);
+    {
+        dao::SpeedBatchDAO batchDao;
+        entity::SpeedBatch batch;
+        batch.batchNo = batchNo;
+        batch.startTime = fmtTime(now - 60);
+        batch.endTime = fmtTime(now + 3600);
+        batch.remark = "一次性领用演示批次";
+        long long bid = batchDao.create(batch);
+        printResult("创建有效起止时间的批次 " + batchNo, bid > 0);
+
+        // 无效窗口（结束早于开始）必须被拒绝
+        entity::SpeedBatch bad;
+        bad.batchNo = batchNo + "-BAD";
+        bad.startTime = fmtTime(now + 100);
+        bad.endTime = fmtTime(now);
+        printResult("拒绝无效批次窗口(end <= start)", batchDao.create(bad) == 0);
+    }
+
+    auto makeSpeed = [&](float v) {
+        entity::Speed s;
+        s.value = v;
+        s.date = today;                 // 保留原有按日期查询口径
+        s.batchNo = batchNo;
+        s.sampledAt = fmtTime(now);
+        return s;
+    };
+
+    // ---------- 场景1：两个领取者同时竞争同一条记录 ----------
+    int r1 = 0;
+    {
+        dao::SpeedDAO dao;
+        r1 = dao.insertWithBatch(makeSpeed(101.5f));
+        printResult("采样入库记录 #" + to_string(r1), r1 > 0);
+    }
+
+    struct ClaimOutcome { bool got = false; int id = -1; };
+    ClaimOutcome oa, ob;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+
+    auto racer = [&](std::string taskId, ClaimOutcome& out, db::DatabaseManager& conn) {
+        dao::SpeedDAO dao(conn);
+        ready.fetch_add(1);
+        while (!go.load()) { std::this_thread::yield(); } // 起跑栅栏，尽量同时进入
+        auto rec = dao.claim(batchNo, taskId, 120, "早班并发领用");
+        if (rec) { out.got = true; out.id = rec->id; }
+    };
+
+    std::thread ta(racer, "task-A", std::ref(oa), std::ref(*connA));
+    std::thread tb(racer, "task-B", std::ref(ob), std::ref(*connB));
+    while (ready.load() < 2) std::this_thread::yield();
+    go.store(true);
+    ta.join(); tb.join();
+
+    int winners = (oa.got ? 1 : 0) + (ob.got ? 1 : 0);
+    cout << "  同时领用结果: task-A " << (oa.got ? "拿到 #" + to_string(oa.id) : "未拿到")
+         << " / task-B " << (ob.got ? "拿到 #" + to_string(ob.id) : "未拿到") << endl;
+    printResult("同一条记录两个并发领取者恰有一个成功",
+                winners == 1 && (!oa.got || !ob.got) && oa.id != ob.id);
+
+    // ---------- 场景2：任务取消后释放，可被另一任务重新领用 ----------
+    std::string winner = oa.got ? "task-A" : "task-B";
+    db::DatabaseManager& winnerConn = oa.got ? *connA : *connB;
+    {
+        dao::SpeedDAO dao(winnerConn);
+        bool released = dao.release(r1, winner, "检测任务取消，归还未消费记录");
+        printResult("持有者取消任务并释放记录 #" + to_string(r1), released);
+    }
+    {
+        dao::SpeedDAO dao(*connA);
+        auto again = dao.claim(batchNo, "task-A", 120, "取消后重新领用");
+        printResult("释放后记录 #" + to_string(r1) + " 可被重新领用",
+                    again.has_value() && again->id == r1);
+    }
+
+    // ---------- 场景3：租约超时，系统回收后重新发放 ----------
+    int r2 = 0;
+    {
+        dao::SpeedDAO dao;
+        r2 = dao.insertWithBatch(makeSpeed(202.5f));
+    }
+    {
+        dao::SpeedDAO slow(*connB);
+        auto rec = slow.claim(batchNo, "slow-task", 1, "领用后处理超时"); // 1秒租约
+        printResult("slow-task 领用记录 #" + to_string(r2) + "（租约1秒）", rec.has_value());
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    {
+        dao::SpeedDAO dao;
+        int n = dao.reclaimExpiredLeases();
+        printResult("超时未消费记录被回收重新释放(#" + to_string(r2) + ")", n >= 1);
+        auto fast = dao.claim(batchNo, "fast-task", 120, "超时回收后重新领用");
+        printResult("回收后记录 #" + to_string(r2) + " 重新发放给 fast-task",
+                    fast.has_value() && fast->id == r2);
+    }
+
+    // ---------- 场景4：确认消费为终态，数据库连接重建也不倒退 ----------
+    {
+        dao::SpeedDAO dao(*connA);
+        bool ok = dao.consume(r2, "fast-task", "检测结果已确认");
+        printResult("fast-task 确认消费记录 #" + to_string(r2), ok);
+    }
+    // 模拟数据库连接重建（关闭后按原配置重连）
+    connA->reconnect();
+    {
+        dao::SpeedDAO dao(*connA);
+        auto rec = dao.findById(r2);
+        bool stillConsumed = rec && rec->status == speed_status::CONSUMED && rec->flag == 1;
+        printResult("重连后记录 #" + to_string(r2) + " 仍为 CONSUMED 终态", stillConsumed);
+
+        bool releaseDenied = !dao.release(r2, "fast-task", "重连后尝试回退");
+        bool otherDenied   = !dao.consume(r2, "intruder-task", "重连后他人尝试确认");
+        printResult("终态记录拒绝释放/他人确认（不可倒退）", releaseDenied && otherDenied);
+    }
+
+    // ---------- 场景5：多条记录并发抢领，全局不重复发放 ----------
+    {
+        dao::SpeedDAO dao;
+        for (int i = 0; i < 20; ++i) dao.insertWithBatch(makeSpeed(300.0f + i));
+    }
+    std::vector<int> claimedIds;
+    std::mutex mtx;
+    std::atomic<int> ready2{0};
+    std::atomic<bool> go2{false};
+    auto drainer = [&](std::string taskId, db::DatabaseManager& conn) {
+        dao::SpeedDAO dao(conn);
+        ready2.fetch_add(1);
+        while (!go2.load()) std::this_thread::yield();
+        while (true) {
+            auto rec = dao.claim(batchNo, taskId, 120, "并发抢领");
+            if (!rec) break;
+            std::lock_guard<std::mutex> lk(mtx);
+            claimedIds.push_back(rec->id);
+        }
+    };
+    std::thread g1(drainer, "task-A", std::ref(*connA));
+    std::thread g2(drainer, "task-B", std::ref(*connB));
+    while (ready2.load() < 2) std::this_thread::yield();
+    go2.store(true);
+    g1.join(); g2.join();
+
+    std::vector<int> sortedIds = claimedIds;
+    std::sort(sortedIds.begin(), sortedIds.end());
+    bool noDup = std::adjacent_find(sortedIds.begin(), sortedIds.end()) == sortedIds.end();
+    cout << "  20 条记录被两个任务并发抢领，共发出 " << claimedIds.size() << " 次" << endl;
+    printResult("并发抢领 20 条记录无重复发放", claimedIds.size() == 20 && noDup);
+
+    // ---------- 追溯：运维查询每条记录历次领取/释放/消费原因 ----------
+    cout << "\n  --- 领用状态历史追溯 ---" << endl;
+    {
+        dao::SpeedDAO dao;
+        printHistory(dao, r1);
+        printHistory(dao, r2);
+
+        // 原有按日期查询方式仍然可用
+        auto byDate = dao.findByDate(today);
+        cout << "\n  原有按日期查询 findByDate('" << today << "') 命中 "
+             << byDate.size() << " 条" << endl;
+    }
+}
 int main() {
     cout << string(60, '*') << endl;
     cout << "  Industrial Inspection System - C++ MySQL Data Access Layer" << endl;
@@ -292,6 +498,11 @@ int main() {
 
         // 5. 执行各表 CRUD 演示
         demoSpeed(speedDao);
+
+        // 5.1 SPEED 一次性领用 / 可追溯流程演示
+        //     （两个并发领取者 + 一次连接重建，验证不重复发放、终态不倒退、历史可查）
+        demoSpeedTraceability(dbConfig);
+
         demoSplice(spliceDao);
         demoFlaw(flawDao);
         demoStop(stopDao);

@@ -8,11 +8,22 @@ namespace dao {
 
     // DAO 基类，提供通用工具方法
     class BaseDAO {
+    public:
+        BaseDAO() = default;
+
+        // 指定独立连接（并发领取演示/多任务进程使用）；
+        // 不传时仍走全局单例，保持原有调用方式不变。
+        explicit BaseDAO(db::DatabaseManager& connection) : connRef_(&connection) {}
+
     protected:
         db::DatabaseManager& db() {
-            return db::DatabaseManager::instance();
+            return connRef_ ? *connRef_ : db::DatabaseManager::instance();
         }
 
+    private:
+        db::DatabaseManager* connRef_ = nullptr;
+
+    protected:
         // 安全转义字符串
         std::string esc(const std::string& val) {
             return "'" + db().escape(val) + "'";
