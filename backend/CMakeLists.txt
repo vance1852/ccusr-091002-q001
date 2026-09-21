@@ -27,6 +27,10 @@ endif()
 message(STATUS "MySQL include: ${MYSQL_INCLUDE_DIR}")
 message(STATUS "MySQL library: ${MYSQL_LIBRARY}")
 
+# 线程库（并发领用演示/测试需要）
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 # ============================================
 # 源文件收集 (排除测试文件)
 # ============================================
@@ -57,13 +61,13 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${MYSQL_INCLUDE_DIR}
 )
-target_link_libraries(${PROJECT_NAME} PRIVATE ${MYSQL_LIBRARY})
+target_link_libraries(${PROJECT_NAME} PRIVATE ${MYSQL_LIBRARY} Threads::Threads)
 
 target_include_directories(IndustrialInspectionTest PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${MYSQL_INCLUDE_DIR}
 )
-target_link_libraries(IndustrialInspectionTest PRIVATE ${MYSQL_LIBRARY})
+target_link_libraries(IndustrialInspectionTest PRIVATE ${MYSQL_LIBRARY} Threads::Threads)
 
 # CTest 支持
 enable_testing()

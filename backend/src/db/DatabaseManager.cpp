@@ -6,6 +6,7 @@ namespace db {
     static const char* TAG = "DatabaseManager";
 
     void DatabaseManager::init(const config::DatabaseConfig& cfg) {
+        std::lock_guard<std::recursive_mutex> lock(mtx_);
         config_ = cfg;
         conn_ = mysql_init(nullptr);
         if (!conn_) {
@@ -40,6 +41,7 @@ namespace db {
     }
 
     void DatabaseManager::close() {
+        std::lock_guard<std::recursive_mutex> lock(mtx_);
         if (conn_) {
             mysql_close(conn_);
             conn_ = nullptr;
@@ -68,6 +70,7 @@ namespace db {
     }
 
     int DatabaseManager::execute(const std::string& sql) {
+        std::lock_guard<std::recursive_mutex> lock(mtx_);
         ensureConnected();
         LOG_DEBUG(TAG, "Execute: " + sql);
 
@@ -84,6 +87,7 @@ namespace db {
     }
 
     ResultSet DatabaseManager::query(const std::string& sql) {
+        std::lock_guard<std::recursive_mutex> lock(mtx_);
         ensureConnected();
         LOG_DEBUG(TAG, "Query: " + sql);
 
@@ -126,6 +130,7 @@ namespace db {
     }
 
     long long DatabaseManager::insertAndGetId(const std::string& sql) {
+        std::lock_guard<std::recursive_mutex> lock(mtx_);
         ensureConnected();
         LOG_DEBUG(TAG, "InsertAndGetId: " + sql);
 
@@ -142,6 +147,7 @@ namespace db {
     }
 
     std::string DatabaseManager::escape(const std::string& str) {
+        std::lock_guard<std::recursive_mutex> lock(mtx_);
         ensureConnected();
         std::vector<char> buf(str.size() * 2 + 1);
         mysql_real_escape_string(conn_, buf.data(), str.c_str(), static_cast<unsigned long>(str.size()));
@@ -149,7 +155,20 @@ namespace db {
     }
 
     bool DatabaseManager::isConnected() const {
+        std::lock_guard<std::recursive_mutex> lock(mtx_);
         return connected_ && conn_ != nullptr;
+    }
+
+    void DatabaseManager::beginTransaction() {
+        execute("START TRANSACTION");
+    }
+
+    void DatabaseManager::commit() {
+        execute("COMMIT");
+    }
+
+    void DatabaseManager::rollback() {
+        execute("ROLLBACK");
     }
 
 } // namespace db

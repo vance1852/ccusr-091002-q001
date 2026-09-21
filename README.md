@@ -23,4 +23,17 @@ docker compose logs -f backend
 
 ## 数据范围
 
-初始化脚本创建 SPEED、SPLICE、FLAW、STOP、COMPARE、HISTORY 和 REMOVE 七张表。字段含义、默认值和索引以 SQL 脚本为准；应用通过 DAO 执行增删改查并在关键操作处记录日志。
+初始化脚本创建 SPEED、SPEED_BATCH、SPEED_CLAIM_EVENT、SPLICE、FLAW、STOP、COMPARE、HISTORY 和 REMOVE 九张表。字段含义、默认值和索引以 SQL 脚本为准；应用通过 DAO 执行增删改查并在关键操作处记录日志。
+
+注意：schema 变更后 MySQL 数据卷不会自动重建，需要 `docker compose down -v` 后再 `docker compose up --build -d` 让初始化脚本重新生效。
+
+## SPEED 一次性领用流程
+
+SPEED 记录按批次（SPEED_BATCH）管理，批次登记时校验起止时间有效（`valid_to > valid_from`，数据库 CHECK 约束兜底），只有处于有效窗口内的批次允许领取。每条记录有状态机 `AVAILABLE -> CLAIMED -> CONSUMED`：
+
+- `SpeedDAO::claimNext / claimById`：单条原子 UPDATE 完成竞争，并发领取时只有一个调用成功，不会重复发放；
+- `SpeedDAO::releaseClaim / releaseExpired`：任务取消或超时后，尚未消费的记录被释放回 AVAILABLE，可重新领取；
+- `SpeedDAO::consumeClaim`：确认消费，只允许 CLAIMED -> CONSUMED，提交后即使数据库连接重建也不会倒退；
+- 每次领取、释放、消费都会在同一事务内写入 SPEED_CLAIM_EVENT（操作者、原因、令牌、时间），运维可用 `findEventsBySpeedId / findEventsByBatch` 查清每条记录的历次流转。
+
+原有 `findByDate` 等按日期查询的调用方式保持不变。应用启动演示（`demoSpeedClaim`）会实际跑一遍双线程并发领取、取消/超时释放、确认后重连的完整流程。

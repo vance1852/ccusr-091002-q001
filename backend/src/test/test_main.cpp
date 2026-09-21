@@ -22,19 +22,62 @@
 #include "../dao/RemoveDAO.h"
 
 #include <cstdlib>
+#include <ctime>
+#include <exception>
+#include <thread>
 
 // ============================================
 // 辅助：清理所有表
 // ============================================
 static void cleanAllTables() {
     auto& dbm = db::DatabaseManager::instance();
+    dbm.execute("DELETE FROM SPEED_CLAIM_EVENT");
     dbm.execute("DELETE FROM SPEED");
+    dbm.execute("DELETE FROM SPEED_BATCH");
     dbm.execute("DELETE FROM SPLICE");
     dbm.execute("DELETE FROM FLAW");
     dbm.execute("DELETE FROM STOP");
     dbm.execute("DELETE FROM COMPARE");
     dbm.execute("DELETE FROM HISTORY");
     dbm.execute("DELETE FROM REMOVE");
+}
+
+// ============================================
+// 辅助：领用流程测试工具
+// ============================================
+
+// 当前时间偏移 seconds 秒后的时间字符串
+static std::string tsOffset(int seconds) {
+    std::time_t t = std::time(nullptr) + seconds;
+    std::tm tm_buf{};
+#ifdef _WIN32
+    localtime_s(&tm_buf, &t);
+#else
+    localtime_r(&t, &tm_buf);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_buf);
+    return buf;
+}
+
+// 登记一个批次，窗口为 [现在+fromOffset, 现在+toOffset]
+static void registerBatch(dao::SpeedDAO& dao, const std::string& batchId,
+                          int fromOffset, int toOffset) {
+    entity::SpeedBatch b;
+    b.batchId = batchId;
+    b.validFrom = tsOffset(fromOffset);
+    b.validTo = tsOffset(toOffset);
+    dao.registerBatch(b);
+}
+
+// 向批次写入一条速度记录
+static int insertSpeed(dao::SpeedDAO& dao, const std::string& batchId, float value) {
+    entity::Speed s;
+    s.batchId = batchId;
+    s.value = value;
+    s.date = tsOffset(0).substr(0, 10);
+    s.sampledAt = tsOffset(0);
+    return dao.insert(s);
 }
 
 // ============================================
@@ -107,20 +150,20 @@ TEST(DatabaseManager_Escape) {
 
 TEST(DatabaseManager_ExecuteAndQuery) {
     auto& dbm = db::DatabaseManager::instance();
-    dbm.execute("DELETE FROM SPEED");
+    cleanAllTables();
     dbm.execute("INSERT INTO SPEED (value, date, flag) VALUES (100.0, '2026-01-01', 0)");
     auto rows = dbm.query("SELECT * FROM SPEED WHERE date = '2026-01-01'");
     ASSERT_EQ(rows.size(), (size_t)1);
     ASSERT_STR_EQ(rows[0].at("date"), "2026-01-01");
-    dbm.execute("DELETE FROM SPEED");
+    cleanAllTables();
 }
 
 TEST(DatabaseManager_InsertAndGetId) {
     auto& dbm = db::DatabaseManager::instance();
-    dbm.execute("DELETE FROM SPEED");
+    cleanAllTables();
     long long id = dbm.insertAndGetId("INSERT INTO SPEED (value, date, flag) VALUES (50.0, '2026-02-01', 0)");
     ASSERT_GT(id, 0LL);
-    dbm.execute("DELETE FROM SPEED");
+    cleanAllTables();
 }
 
 TEST(DatabaseManager_QueryEmptyResult) {
@@ -247,6 +290,219 @@ TEST(SpeedDAO_Count) {
     dao.insert(s);
     dao.insert(s);
     ASSERT_EQ(dao.count(), 2);
+}
+
+// ============================================
+// 4b. SpeedDAO 一次性领用流程测试
+// ============================================
+TEST(SpeedDAO_RegisterBatchRejectsInvalidWindow) {
+    cleanAllTables();
+    dao::SpeedDAO dao;
+    entity::SpeedBatch b;
+    b.batchId = "B-BAD-WINDOW";
+    b.validFrom = "2026-09-21 10:00:00";
+    b.validTo = "2026-09-21 09:00:00";  // 截止早于起始，必须被拒绝
+    ASSERT_THROWS(dao.registerBatch(b), std::invalid_argument);
+    ASSERT_FALSE(dao.findBatch("B-BAD-WINDOW").has_value());
+}
+
+TEST(SpeedDAO_RegisterBatchAndFind) {
+    cleanAllTables();
+    dao::SpeedDAO dao;
+    registerBatch(dao, "B-VALID", -3600, 3600);
+    auto found = dao.findBatch("B-VALID");
+    ASSERT_TRUE(found.has_value());
+    ASSERT_STR_EQ(found->batchId, "B-VALID");
+    ASSERT_TRUE(found->validFrom < found->validTo);
+}
+
+TEST(SpeedDAO_ClaimNextSingleWinnerConcurrent) {
+    cleanAllTables();
+    dao::SpeedDAO dao;
+    registerBatch(dao, "B-RACE", -3600, 3600);
+    int id = insertSpeed(dao, "B-RACE", 66.6f);
+
+    // 两个线程同时领取批次内唯一一条记录
+    std::optional<entity::Speed> r1, r2;
+    std::exception_ptr e1, e2;
+    std::thread t1([&] {
+        try { r1 = dao.claimNext("B-RACE", "task-1", "并发测试"); }
+        catch (...) { e1 = std::current_exception(); }
+    });
+    std::thread t2([&] {
+        try { r2 = dao.claimNext("B-RACE", "task-2", "并发测试"); }
+        catch (...) { e2 = std::current_exception(); }
+    });
+    t1.join();
+    t2.join();
+    if (e1) std::rethrow_exception(e1);
+    if (e2) std::rethrow_exception(e2);
+
+    // 恰好一个成功，不会重复发放
+    ASSERT_TRUE(r1.has_value() != r2.has_value());
+    auto& winner = r1.has_value() ? r1 : r2;
+    ASSERT_EQ(winner->id, id);
+    ASSERT_STR_EQ(winner->status, "CLAIMED");
+    ASSERT_FALSE(winner->claimToken.empty());
+
+    // 只有一条 CLAIM 事件
+    auto events = dao.findEventsBySpeedId(id);
+    ASSERT_EQ(events.size(), (size_t)1);
+    ASSERT_STR_EQ(events[0].event, "CLAIM");
+}
+
+TEST(SpeedDAO_ClaimByIdDoubleClaimFails) {
+    cleanAllTables();
+    dao::SpeedDAO dao;
+    registerBatch(dao, "B-DOUBLE", -3600, 3600);
+    int id = insertSpeed(dao, "B-DOUBLE", 10.0f);
+
+    auto first = dao.claimById(id, "task-1", "第一次领取");
+    ASSERT_TRUE(first.has_value());
+    // 同一条记录第二次领取必须失败
+    auto second = dao.claimById(id, "task-2", "第二次领取");
+    ASSERT_FALSE(second.has_value());
+}
+
+TEST(SpeedDAO_ReleaseOnCancelAllowsReclaim) {
+    cleanAllTables();
+    dao::SpeedDAO dao;
+    registerBatch(dao, "B-CANCEL", -3600, 3600);
+    int id = insertSpeed(dao, "B-CANCEL", 20.0f);
+
+    auto c1 = dao.claimNext("B-CANCEL", "task-1", "首次领取");
+    ASSERT_TRUE(c1.has_value());
+
+    // 任务取消：释放后回到 AVAILABLE
+    ASSERT_TRUE(dao.releaseClaim(id, c1->claimToken, "task-1", "任务取消"));
+    auto after = dao.findById(id);
+    ASSERT_STR_EQ(after->status, "AVAILABLE");
+    ASSERT_STR_EQ(after->claimedBy, "");
+
+    // 可以再次被领取，且令牌更新
+    auto c2 = dao.claimNext("B-CANCEL", "task-2", "取消后重领");
+    ASSERT_TRUE(c2.has_value());
+    ASSERT_NE(c1->claimToken, c2->claimToken);
+
+    // 旧令牌已失效，不能再用它释放
+    ASSERT_FALSE(dao.releaseClaim(id, c1->claimToken, "task-1", "过期令牌释放"));
+}
+
+TEST(SpeedDAO_ReleaseExpiredByTimeout) {
+    cleanAllTables();
+    dao::SpeedDAO dao;
+    registerBatch(dao, "B-TIMEOUT", -3600, 3600);
+    int id1 = insertSpeed(dao, "B-TIMEOUT", 1.0f);
+    int id2 = insertSpeed(dao, "B-TIMEOUT", 2.0f);
+
+    ASSERT_TRUE(dao.claimNext("B-TIMEOUT", "task-1", "领取1").has_value());
+    ASSERT_TRUE(dao.claimNext("B-TIMEOUT", "task-2", "领取2").has_value());
+
+    // 超时清扫：已领取但超过 0 秒未消费的记录全部释放
+    int released = dao.releaseExpired("B-TIMEOUT", 0, "sweeper", "超时未消费");
+    ASSERT_EQ(released, 2);
+    ASSERT_STR_EQ(dao.findById(id1)->status, "AVAILABLE");
+    ASSERT_STR_EQ(dao.findById(id2)->status, "AVAILABLE");
+
+    // 每条记录都有 领取->释放 的完整历史
+    auto events = dao.findEventsBySpeedId(id1);
+    ASSERT_EQ(events.size(), (size_t)2);
+    ASSERT_STR_EQ(events[0].event, "CLAIM");
+    ASSERT_STR_EQ(events[1].event, "RELEASE");
+    ASSERT_STR_EQ(events[1].reason, "超时未消费");
+}
+
+TEST(SpeedDAO_ConsumedRecordCannotRegress) {
+    cleanAllTables();
+    dao::SpeedDAO dao;
+    registerBatch(dao, "B-FINAL", -3600, 3600);
+    int id = insertSpeed(dao, "B-FINAL", 30.0f);
+
+    auto c = dao.claimNext("B-FINAL", "task-1", "领取");
+    ASSERT_TRUE(c.has_value());
+    ASSERT_TRUE(dao.consumeClaim(id, c->claimToken, "task-1", "检测完成确认"));
+    ASSERT_STR_EQ(dao.findById(id)->status, "CONSUMED");
+
+    // 已确认的记录：不能再领取、不能释放、不能重复消费
+    ASSERT_FALSE(dao.claimById(id, "task-2", "抢领").has_value());
+    ASSERT_FALSE(dao.releaseClaim(id, c->claimToken, "task-1", "尝试回退"));
+    ASSERT_FALSE(dao.consumeClaim(id, c->claimToken, "task-1", "重复确认"));
+    ASSERT_STR_EQ(dao.findById(id)->status, "CONSUMED");
+}
+
+TEST(SpeedDAO_ConsumedSurvivesReconnect) {
+    cleanAllTables();
+    dao::SpeedDAO dao;
+    registerBatch(dao, "B-RECONNECT", -3600, 3600);
+    int id = insertSpeed(dao, "B-RECONNECT", 40.0f);
+
+    auto c = dao.claimNext("B-RECONNECT", "task-1", "领取");
+    ASSERT_TRUE(c.has_value());
+    ASSERT_TRUE(dao.consumeClaim(id, c->claimToken, "task-1", "检测完成确认"));
+
+    // 模拟数据库连接重建
+    db::DatabaseManager::instance().close();
+    config::DatabaseConfig cfg;
+    cfg.loadFromEnv();
+    db::DatabaseManager::instance().init(cfg);
+
+    // 已确认的结果不倒退，也不能再被领走
+    auto found = dao.findById(id);
+    ASSERT_TRUE(found.has_value());
+    ASSERT_STR_EQ(found->status, "CONSUMED");
+    ASSERT_FALSE(dao.claimById(id, "task-9", "重连后抢领").has_value());
+
+    // 领用历史在重连后依然完整可查
+    auto events = dao.findEventsBySpeedId(id);
+    ASSERT_EQ(events.size(), (size_t)2);
+    ASSERT_STR_EQ(events[1].event, "CONSUME");
+}
+
+TEST(SpeedDAO_ExpiredBatchCannotBeClaimed) {
+    cleanAllTables();
+    dao::SpeedDAO dao;
+    registerBatch(dao, "B-EXPIRED", -7200, -3600);  // 窗口已过期
+    int id = insertSpeed(dao, "B-EXPIRED", 50.0f);
+
+    ASSERT_FALSE(dao.claimNext("B-EXPIRED", "task-1", "过期批次领取").has_value());
+    ASSERT_FALSE(dao.claimById(id, "task-1", "过期批次领取").has_value());
+    ASSERT_STR_EQ(dao.findById(id)->status, "AVAILABLE");
+}
+
+TEST(SpeedDAO_EventsAuditTrail) {
+    cleanAllTables();
+    dao::SpeedDAO dao;
+    registerBatch(dao, "B-AUDIT", -3600, 3600);
+    int id = insertSpeed(dao, "B-AUDIT", 60.0f);
+
+    // 领取 -> 取消释放 -> 再领取 -> 确认消费
+    auto c1 = dao.claimNext("B-AUDIT", "task-1", "早班检测领用");
+    ASSERT_TRUE(c1.has_value());
+    ASSERT_TRUE(dao.releaseClaim(id, c1->claimToken, "task-1", "任务取消"));
+    auto c2 = dao.claimNext("B-AUDIT", "task-2", "取消后重领");
+    ASSERT_TRUE(c2.has_value());
+    ASSERT_TRUE(dao.consumeClaim(id, c2->claimToken, "task-2", "检测完成确认"));
+
+    // 运维可查清历次领取、释放、消费及其原因
+    auto events = dao.findEventsBySpeedId(id);
+    ASSERT_EQ(events.size(), (size_t)4);
+    ASSERT_STR_EQ(events[0].event, "CLAIM");
+    ASSERT_STR_EQ(events[0].actor, "task-1");
+    ASSERT_STR_EQ(events[0].reason, "早班检测领用");
+    ASSERT_STR_EQ(events[1].event, "RELEASE");
+    ASSERT_STR_EQ(events[1].reason, "任务取消");
+    ASSERT_STR_EQ(events[2].event, "CLAIM");
+    ASSERT_STR_EQ(events[2].actor, "task-2");
+    ASSERT_STR_EQ(events[3].event, "CONSUME");
+    ASSERT_STR_EQ(events[3].reason, "检测完成确认");
+    for (auto& e : events) {
+        ASSERT_STR_EQ(e.batchId, "B-AUDIT");
+        ASSERT_FALSE(e.createdAt.empty());
+    }
+
+    // 按批次也能查到同样的历史
+    auto byBatch = dao.findEventsByBatch("B-AUDIT");
+    ASSERT_EQ(byBatch.size(), (size_t)4);
 }
 
 // ============================================

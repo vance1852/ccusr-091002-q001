@@ -12,6 +12,8 @@
 #include <iostream>
 #include <string>
 #include <iomanip>
+#include <ctime>
+#include <thread>
 
 #include "config/AppConfig.h"
 #include "utils/Logger.h"
@@ -37,6 +39,19 @@ static void printSeparator(const string& title) {
 
 static void printResult(const string& operation, bool success) {
     cout << "  [" << (success ? "OK" : "FAIL") << "] " << operation << endl;
+}
+
+// 格式化时间戳（批次窗口、采样时刻）
+static string formatTs(time_t t) {
+    std::tm tm_buf{};
+#ifdef _WIN32
+    localtime_s(&tm_buf, &t);
+#else
+    localtime_r(&t, &tm_buf);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_buf);
+    return buf;
 }
 
 // ============================================
@@ -79,6 +94,106 @@ static void demoSpeed(dao::SpeedDAO& speedDao) {
     // DELETE
     affected = speedDao.deleteById(id);
     printResult("DELETE id=" + to_string(id), affected > 0);
+}
+
+// ============================================
+// SPEED 一次性领用流程演示：
+// 批次有效性校验、双任务并发领取、取消/超时释放、确认后重连不倒退、运维审计
+// ============================================
+static void demoSpeedClaim(dao::SpeedDAO& speedDao) {
+    printSeparator("SPEED 一次性领用流程（批次 / 并发 / 重连）");
+
+    time_t now = std::time(nullptr);
+    string batchId = "BATCH-DEMO-" + to_string(static_cast<long long>(now));
+
+    // 1. 登记批次：起止时间必须有效
+    entity::SpeedBatch batch;
+    batch.batchId = batchId;
+    batch.validFrom = formatTs(now - 3600);
+    batch.validTo = formatTs(now + 3600);
+    speedDao.registerBatch(batch);
+    printResult("登记有效批次 " + batchId, true);
+
+    entity::SpeedBatch bad;
+    bad.batchId = batchId + "-BAD";
+    bad.validFrom = formatTs(now + 3600);
+    bad.validTo = formatTs(now - 3600);  // 截止早于起始，必须被拒绝
+    bool rejected = false;
+    try {
+        speedDao.registerBatch(bad);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    printResult("拒绝起止时间无效的批次", rejected);
+
+    // 过期批次即使登记成功也不可领取
+    entity::SpeedBatch expired;
+    expired.batchId = batchId + "-EXPIRED";
+    expired.validFrom = formatTs(now - 7200);
+    expired.validTo = formatTs(now - 3600);
+    speedDao.registerBatch(expired);
+    entity::Speed oldRec;
+    oldRec.batchId = expired.batchId;
+    oldRec.value = 1.0f;
+    oldRec.date = formatTs(now).substr(0, 10);
+    oldRec.sampledAt = formatTs(now - 7000);
+    speedDao.insert(oldRec);
+    bool expiredClaim = speedDao.claimNext(expired.batchId, "task-C", "过期批次领取").has_value();
+    printResult("过期批次不可领取", !expiredClaim);
+
+    // 2. 写入一条该批次的速度记录
+    entity::Speed s;
+    s.batchId = batchId;
+    s.value = 88.8f;
+    s.date = formatTs(now).substr(0, 10);
+    s.sampledAt = formatTs(now);
+    int speedId = speedDao.insert(s);
+    printResult("INSERT 批次速度记录 (id=" + to_string(speedId) + ")", speedId > 0);
+
+    // 3. 两个检测任务同时领取同一条记录：只有一个成功
+    std::optional<entity::Speed> claimA, claimB;
+    std::thread t1([&] { claimA = speedDao.claimNext(batchId, "task-A", "早班检测领用"); });
+    std::thread t2([&] { claimB = speedDao.claimNext(batchId, "task-B", "早班检测领用"); });
+    t1.join();
+    t2.join();
+    bool exactlyOne = claimA.has_value() != claimB.has_value();
+    printResult("两个并发领取只有一个成功", exactlyOne);
+    entity::Speed first = claimA ? *claimA : *claimB;
+    cout << "    领取成功方: " << first.claimedBy << ", token=" << first.claimToken << endl;
+
+    // 4. 任务取消：释放未消费的记录，可重新领取
+    bool released = speedDao.releaseClaim(speedId, first.claimToken, first.claimedBy, "任务取消");
+    printResult("任务取消后释放记录", released);
+
+    // 5. 再次领取后搁置，由超时清扫重新释放
+    auto second = speedDao.claimNext(batchId, "task-B", "取消后重新领用");
+    printResult("释放后可重新领取", second.has_value());
+    int swept = speedDao.releaseExpired(batchId, 0, "sweeper", "超时未消费");
+    printResult("超时未消费记录被重新释放", swept == 1);
+
+    // 6. 重新领取并确认消费（提交后持久化）
+    auto third = speedDao.claimNext(batchId, "task-A", "超时释放后领用");
+    bool consumed = third && speedDao.consumeClaim(speedId, third->claimToken, "task-A", "检测完成确认");
+    printResult("确认消费（提交后持久化）", consumed);
+
+    // 7. 模拟数据库连接重建：已确认的结果不能倒退
+    db::DatabaseManager::instance().close();
+    config::DatabaseConfig cfg;
+    cfg.loadFromEnv();
+    db::DatabaseManager::instance().init(cfg);
+    auto after = speedDao.findById(speedId);
+    bool stillConsumed = after && after->status == "CONSUMED";
+    printResult("连接重建后已确认结果不倒退", stillConsumed);
+    bool reClaim = speedDao.claimById(speedId, "task-B", "重连后抢领").has_value();
+    bool reRelease = third && speedDao.releaseClaim(speedId, third->claimToken, "task-B", "重连后释放");
+    printResult("已确认记录不可再领取/释放", !reClaim && !reRelease);
+
+    // 8. 运维审计：打印该记录的全部领用历史及原因
+    cout << "  领用历史（speed_id=" << speedId << "）:" << endl;
+    for (auto& e : speedDao.findEventsBySpeedId(speedId)) {
+        cout << "    [" << e.createdAt << "] " << e.event
+             << " by " << e.actor << " - " << e.reason << endl;
+    }
 }
 
 static void demoSplice(dao::SpliceDAO& spliceDao) {
@@ -292,6 +407,7 @@ int main() {
 
         // 5. 执行各表 CRUD 演示
         demoSpeed(speedDao);
+        demoSpeedClaim(speedDao);
         demoSplice(spliceDao);
         demoFlaw(flawDao);
         demoStop(stopDao);

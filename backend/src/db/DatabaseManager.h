@@ -9,8 +9,10 @@
 #include <vector>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <functional>
+#include <type_traits>
 #include "../config/AppConfig.h"
 #include "../utils/Logger.h"
 
@@ -54,6 +56,40 @@ namespace db {
         // 检查连接是否存活
         bool isConnected() const;
 
+        // 事务边界：开启事务
+        void beginTransaction();
+
+        // 事务边界：提交。提交后的结果持久化，连接重建也不会倒退
+        void commit();
+
+        // 事务边界：回滚。未提交的修改全部撤销
+        void rollback();
+
+        // 在事务中执行 fn：全程持有连接锁（单连接串行化，多线程调用安全），
+        // fn 正常返回则自动提交，抛出异常则自动回滚。
+        template <typename Fn>
+        auto transaction(Fn&& fn) -> decltype(fn()) {
+            std::lock_guard<std::recursive_mutex> lock(mtx_);
+            beginTransaction();
+            try {
+                if constexpr (std::is_void<decltype(fn())>::value) {
+                    fn();
+                    commit();
+                } else {
+                    decltype(fn()) result = fn();
+                    commit();
+                    return result;
+                }
+            } catch (...) {
+                try {
+                    rollback();
+                } catch (...) {
+                    // 连接可能已断开；未提交的事务会由服务端在连接关闭时回滚
+                }
+                throw;
+            }
+        }
+
     private:
         DatabaseManager() = default;
         ~DatabaseManager();
@@ -64,6 +100,8 @@ namespace db {
         MYSQL* conn_ = nullptr;
         config::DatabaseConfig config_;
         bool connected_ = false;
+        // 单连接互斥锁（递归）：事务边界内可多次进入 execute/query
+        mutable std::recursive_mutex mtx_;
 
         void ensureConnected();
         void reconnect();
